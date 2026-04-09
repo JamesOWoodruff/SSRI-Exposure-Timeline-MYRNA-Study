@@ -1,0 +1,153 @@
+library(tidyverse)
+
+analytic_labtab <- Labtab_Data %>%
+  left_join(scores, by = "redcap_id")
+
+cat("N:", nrow(analytic_labtab), "\n")
+cat("With SSRI scores:", sum(!is.na(analytic_labtab$ssri_dose_weeks)), "\n")
+cat("With labtab data:", sum(!is.na(analytic_labtab$baseline_lab_arm6m_t1)), "\n")
+cat("With both:", sum(!is.na(analytic_labtab$ssri_dose_weeks) & !is.na(analytic_labtab$baseline_lab_arm6m_t1)), "\n")
+
+analytic_labtab <- analytic_labtab %>%
+  mutate(
+    ssri_dose_weeks = replace_na(ssri_dose_weeks, 0),
+    ssri_mean_dose  = replace_na(ssri_mean_dose,  0)
+  )
+
+cat("With both after recoding:", sum(!is.na(analytic_labtab$ssri_dose_weeks) & !is.na(analytic_labtab$baseline_lab_arm6m_t1)), "\n")
+
+
+analytic_labtab <- Labtab_Data %>%
+  mutate(redcap_id = as.character(redcap_id)) %>%
+  left_join(scores, by = "redcap_id") %>%
+  mutate(
+    ssri_dose_weeks = replace_na(ssri_dose_weeks, 0),
+    ssri_mean_dose  = replace_na(ssri_mean_dose,  0)
+  )
+
+cat("N:", nrow(analytic_labtab), "\n")
+cat("With SSRI scores > 0:", sum(analytic_labtab$ssri_dose_weeks > 0), "\n")
+cat("With labtab data:", sum(!is.na(analytic_labtab$baseline_lab_arm6m_t1)), "\n")
+
+# ── 3. COERCE PART COLUMNS TO NUMERIC ─────────────────────────────────────────
+
+analytic_labtab <- analytic_labtab %>%
+  mutate(across(c(int_facang_t1p1, int_facang_t1p2, int_facang_t1p3,
+                  intfacsad_t1p1, intfacsad_t1p2, intfacsad_t1p3,
+                  bs_t1_p1, bs_t1_p2, bs_t1_p3,
+                  intvoc_t1p1, intvoc_t1p2, intvoc_t1p3,
+                  intbody_t1p1, intbody_t1p2, intbody_t1p3),
+                ~ suppressWarnings(as.numeric(.))))
+
+# ── 4. COMPUTE AGGREGATED PART SCORES ─────────────────────────────────────────
+
+analytic_labtab <- analytic_labtab %>%
+  mutate(
+    # Facial anger
+    int_facang_mean = rowMeans(cbind(int_facang_t1p1, int_facang_t1p2, int_facang_t1p3), na.rm = TRUE),
+    int_facang_max  = pmax(int_facang_t1p1, int_facang_t1p2, int_facang_t1p3, na.rm = TRUE),
+
+    # Facial sadness
+    intfacsad_mean  = rowMeans(cbind(intfacsad_t1p1, intfacsad_t1p2, intfacsad_t1p3), na.rm = TRUE),
+    intfacsad_max   = pmax(intfacsad_t1p1, intfacsad_t1p2, intfacsad_t1p3, na.rm = TRUE),
+
+    # Bodily sadness
+    bs_any          = as.integer(pmax(bs_t1_p1, bs_t1_p2, bs_t1_p3, na.rm = TRUE) > 0),
+    bs_prop         = rowMeans(cbind(bs_t1_p1, bs_t1_p2, bs_t1_p3), na.rm = TRUE),
+
+    # Vocal distress
+    intvoc_mean     = rowMeans(cbind(intvoc_t1p1, intvoc_t1p2, intvoc_t1p3), na.rm = TRUE),
+    intvoc_max      = pmax(intvoc_t1p1, intvoc_t1p2, intvoc_t1p3, na.rm = TRUE),
+
+    # Bodily struggle
+    intbody_mean    = rowMeans(cbind(intbody_t1p1, intbody_t1p2, intbody_t1p3), na.rm = TRUE),
+    intbody_max     = pmax(intbody_t1p1, intbody_t1p2, intbody_t1p3, na.rm = TRUE)
+  )
+
+# ── 5. CLEAN NaN/Inf IN ALL OUTCOME COLUMNS ───────────────────────────────────
+
+linear_outcomes <- c(
+  "baseline_lab_arm6m_t1",
+  "ang_lab_arm6m_t1",
+  "sad_lab_arm6m_t1",
+  "int_facang_t1p1", "int_facang_t1p2", "int_facang_t1p3",
+  "int_facang_mean", "int_facang_max",
+  "intfacsad_t1p1", "intfacsad_t1p2", "intfacsad_t1p3",
+  "intfacsad_mean", "intfacsad_max",
+  "intvoc_t1p1", "intvoc_t1p2", "intvoc_t1p3",
+  "intvoc_mean", "intvoc_max",
+  "intbody_t1p1", "intbody_t1p2", "intbody_t1p3",
+  "intbody_mean", "intbody_max"
+)
+
+logistic_outcomes <- c(
+  "bs_t1_p1", "bs_t1_p2", "bs_t1_p3",
+  "bs_any"
+)
+
+analytic_labtab <- analytic_labtab %>%
+  mutate(across(all_of(c(linear_outcomes, logistic_outcomes)),
+                ~ {
+                  x <- suppressWarnings(as.numeric(.))
+                  if_else(is.nan(x) | is.infinite(x), NA_real_, x)
+                }))
+
+# ── 6. DEFINE PREDICTORS ──────────────────────────────────────────────────────
+
+predictors <- c("ssri_dose_weeks", "ssri_mean_dose")
+
+# ── 7. FIT MODELS ─────────────────────────────────────────────────────────────
+
+fit_linear_models <- function(outcomes, predictor, data) {
+  map_dfr(outcomes, function(y) {
+    dat <- data %>%
+      filter(!is.na(.data[[y]]), !is.nan(.data[[y]]), !is.infinite(.data[[y]]),
+             !is.na(.data[[predictor]]))
+    if (nrow(dat) < 5 || length(unique(dat[[y]])) < 2) return(NULL)
+    fit <- lm(as.formula(paste(y, "~", predictor)), data = dat)
+    tidy(fit) %>%
+      filter(term == predictor) %>%
+      mutate(outcome = y, predictor = predictor, n = nrow(dat), model = "linear")
+  })
+}
+
+fit_logistic_models <- function(outcomes, predictor, data) {
+  map_dfr(outcomes, function(y) {
+    dat <- data %>%
+      filter(!is.na(.data[[y]]), !is.nan(.data[[y]]), !is.infinite(.data[[y]]),
+             !is.na(.data[[predictor]]))
+    if (nrow(dat) < 5 || length(unique(dat[[y]])) < 2) return(NULL)
+    fit <- glm(as.formula(paste(y, "~", predictor)),
+               data = dat, family = binomial())
+    tidy(fit) %>%
+      filter(term == predictor) %>%
+      mutate(outcome = y, predictor = predictor, n = nrow(dat), model = "logistic",
+             OR    = exp(estimate),
+             OR_lo = exp(estimate - 1.96 * std.error),
+             OR_hi = exp(estimate + 1.96 * std.error))
+  })
+}
+
+results_linear   <- map_dfr(predictors, ~ fit_linear_models(linear_outcomes,   .x, analytic_labtab))
+results_logistic <- map_dfr(predictors, ~ fit_logistic_models(logistic_outcomes, .x, analytic_labtab))
+
+# ── 8. COMBINE AND DISPLAY ────────────────────────────────────────────────────
+
+results_all <- bind_rows(
+  results_linear   %>% select(predictor, outcome, model, n, estimate, std.error, statistic, p.value),
+  results_logistic %>% select(predictor, outcome, model, n, estimate, std.error, statistic, p.value, OR, OR_lo, OR_hi)
+) %>%
+  arrange(predictor, outcome) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+cat("=== LINEAR MODELS ===\n")
+results_all %>% filter(model == "linear") %>% print(n = Inf)
+
+cat("\n=== LOGISTIC MODELS ===\n")
+results_all %>% filter(model == "logistic") %>% print(n = Inf)
+
+# ── 9. EXPORT ─────────────────────────────────────────────────────────────────
+
+write.csv(results_all,
+          file = "C:/Users/jowjo/OneDrive/Desktop/ALL NYSPI/Data for Nicolo/Med Exposures Github Coded/Labtab_DoseEffect_Results.csv",
+          row.names = FALSE)
