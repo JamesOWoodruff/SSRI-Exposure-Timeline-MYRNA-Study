@@ -1,0 +1,279 @@
+library(tidyverse)
+library(openxlsx)
+
+END_OF_PREGNANCY <- 40
+
+ssri_equiv <- c(
+  "citalopram"    = 20,
+  "escitalopram"  = 10,
+  "fluoxetine"    = 20,
+  "paroxetine"    = 20,
+  "sertraline"    = 50
+)
+
+# ── 1. PIVOT WIDE → LONG ──────────────────────────────────────────────────────
+
+rx_slots <- 1:7
+
+long <- map_dfr(rx_slots, function(i) {
+  name_col  <- paste0("name_rx",      i)
+  class_col <- paste0("class_rx",     i)
+  start_col <- paste0("pma_start_rx", i)
+  stop_col  <- paste0("pma_stop_rx",  i)
+  dose_col  <- paste0("dose_rx",      i)
+
+  Medication_Data %>%
+    select(
+      redcap_id,
+      drug  = all_of(name_col),
+      class = all_of(class_col),
+      start = all_of(start_col),
+      stop  = all_of(stop_col),
+      dose  = all_of(dose_col)
+    ) %>%
+    mutate(slot = i)
+}) %>%
+  filter(!is.na(drug), drug != "")
+
+# ── 2. FILTER TO SSRI ONLY ────────────────────────────────────────────────────
+
+ssri_names <- names(ssri_equiv)
+
+ssri_long <- long %>%
+  mutate(
+    is_ssri_class = str_detect(tolower(class), "isrs"),
+    is_ssri_name  = tolower(drug) %in% ssri_names,
+    is_ssri       = is_ssri_class | is_ssri_name
+  ) %>%
+  filter(is_ssri) %>%
+  select(redcap_id, slot, drug, start, stop, dose)
+
+# ── 3. PARSE START / STOP TIMES ───────────────────────────────────────────────
+
+parse_time <- function(x) {
+  x <- str_trim(as.character(x))
+  if (x %in% c("", "NA", "?", "UNK", "UNK-during pregnancy",
+                "UNK- beginning of pregnancy", "UNK-Unsure if taken")) return(NA_real_)
+  suppressWarnings(as.numeric(x))
+}
+
+ssri_long <- ssri_long %>%
+  mutate(
+    start_num = map_dbl(start, parse_time),
+    stop_num  = map_dbl(stop,  parse_time),
+    start_num = if_else(is.na(start_num), 0, start_num),
+    stop_num  = if_else(is.na(stop_num),  END_OF_PREGNANCY, stop_num),
+    start_num = if_else(start_num < 0, 0, start_num)
+  )
+
+# ── 4. PARSE DOSES ────────────────────────────────────────────────────────────
+
+parse_dose <- function(x) {
+  x <- str_trim(tolower(as.character(x)))
+  if (x %in% c("", "na", "unk")) return(NA_real_)
+  nums <- as.numeric(unlist(str_extract_all(x, "[0-9]+\\.?[0-9]*")))
+  if (length(nums) == 0) return(NA_real_)
+  base <- if (length(nums) >= 2 && str_detect(x, "[0-9]\\s*-\\s*[0-9]")) {
+    mean(nums[1:2])
+  } else {
+    nums[1]
+  }
+  mult <- case_when(
+    str_detect(x, "bid|2\\s*x|x\\s*2|twice")          ~ 2,
+    str_detect(x, "tid|3\\s*x|x\\s*3|three times")    ~ 3,
+    str_detect(x, "qid|4\\s*x|x\\s*4|four times")     ~ 4,
+    str_detect(x, "1 jour sur 2|every other day|q2d") ~ 0.5,
+    TRUE                                               ~ 1
+  )
+  base * mult
+}
+
+ssri_long <- ssri_long %>%
+  mutate(
+    dose_daily_mg = map_dbl(dose, parse_dose),
+    dose_flag     = is.na(dose_daily_mg)
+  )
+
+# ── 5. CITALOPRAM EQUIVALENTS ─────────────────────────────────────────────────
+
+ssri_long <- ssri_long %>%
+  mutate(
+    drug_lower = tolower(str_trim(drug)),
+    ref_dose = case_when(
+      str_detect(drug_lower, "citalopram")   ~ ssri_equiv["citalopram"],
+      str_detect(drug_lower, "escitalopram") ~ ssri_equiv["escitalopram"],
+      str_detect(drug_lower, "fluoxetine")   ~ ssri_equiv["fluoxetine"],
+      str_detect(drug_lower, "paroxetine")   ~ ssri_equiv["paroxetine"],
+      str_detect(drug_lower, "sertraline")   ~ ssri_equiv["sertraline"],
+      TRUE                                   ~ NA_real_
+    ),
+    cit_equiv_dose = (dose_daily_mg / ref_dose) * ssri_equiv["citalopram"]
+  )
+
+# ── 6. DEDUPLICATE ────────────────────────────────────────────────────────────
+
+ssri_long <- ssri_long %>%
+  distinct(redcap_id, drug_lower, start_num, stop_num, dose_daily_mg, .keep_all = TRUE)
+
+# ── 7. OVERLAP RESOLUTION ─────────────────────────────────────────────────────
+
+resolve_overlaps <- function(df, dose_col) {
+  breaks <- sort(unique(c(df$start_num, df$stop_num)))
+  if (length(breaks) < 2) return(
+    tibble(start_num = df$start_num[1], stop_num = df$stop_num[1],
+           dose_val = df[[dose_col]][1])
+  )
+  intervals <- tibble(
+    start_num = breaks[-length(breaks)],
+    stop_num  = breaks[-1]
+  )
+  intervals %>%
+    mutate(
+      dose_val = map2_dbl(start_num, stop_num, function(s, e) {
+        mid <- (s + e) / 2
+        active <- df %>% filter(start_num <= mid, stop_num > mid)
+        if (nrow(active) == 0) return(NA_real_)
+        max(active[[dose_col]], na.rm = TRUE)
+      })
+    ) %>%
+    filter(!is.na(dose_val), stop_num > start_num)
+}
+
+# Timeline for citalopram-equivalent scores
+timeline_cit <- ssri_long %>%
+  filter(!is.na(cit_equiv_dose)) %>%
+  group_by(redcap_id) %>%
+  group_modify(~ resolve_overlaps(.x, "cit_equiv_dose")) %>%
+  ungroup() %>%
+  rename(cit_equiv_dose = dose_val)
+
+# ── 8. CITALOPRAM-EQUIVALENT SCORES ───────────────────────────────────────────
+
+scores_cit <- timeline_cit %>%
+  mutate(duration = stop_num - start_num) %>%
+  group_by(redcap_id) %>%
+  summarise(
+    ssri_cit_dose_weeks = sum(cit_equiv_dose * duration, na.rm = TRUE),
+    ssri_cit_mean_dose  = ssri_cit_dose_weeks / END_OF_PREGNANCY,
+    .groups = "drop"
+  )
+
+# ── 9. RAW MG SCORES PER DRUG ─────────────────────────────────────────────────
+# Resolve overlaps within drug, then sum across weeks
+
+resolve_overlaps_raw <- function(df) {
+  breaks <- sort(unique(c(df$start_num, df$stop_num)))
+  if (length(breaks) < 2) return(
+    tibble(start_num = df$start_num[1], stop_num = df$stop_num[1],
+           dose_daily_mg = df$dose_daily_mg[1])
+  )
+  intervals <- tibble(
+    start_num = breaks[-length(breaks)],
+    stop_num  = breaks[-1]
+  )
+  intervals %>%
+    mutate(
+      dose_daily_mg = map2_dbl(start_num, stop_num, function(s, e) {
+        mid <- (s + e) / 2
+        active <- df %>% filter(start_num <= mid, stop_num > mid)
+        if (nrow(active) == 0) return(NA_real_)
+        max(active$dose_daily_mg, na.rm = TRUE)
+      })
+    ) %>%
+    filter(!is.na(dose_daily_mg), stop_num > start_num)
+}
+
+timeline_raw <- ssri_long %>%
+  filter(!is.na(dose_daily_mg)) %>%
+  group_by(redcap_id, drug_lower) %>%
+  group_modify(~ resolve_overlaps_raw(.x)) %>%
+  ungroup()
+
+scores_raw_long <- timeline_raw %>%
+  mutate(duration = stop_num - start_num) %>%
+  group_by(redcap_id, drug_lower) %>%
+  summarise(
+    raw_dose_weeks = sum(dose_daily_mg * duration, na.rm = TRUE),
+    raw_mean_dose  = raw_dose_weeks / END_OF_PREGNANCY,
+    .groups = "drop"
+  )
+
+# Pivot wide: one column pair per drug
+scores_raw_wide <- scores_raw_long %>%
+  pivot_wider(
+    id_cols     = redcap_id,
+    names_from  = drug_lower,
+    values_from = c(raw_dose_weeks, raw_mean_dose),
+    names_glue  = "{drug_lower}_{.value}"
+  )
+
+# ── 10. USAGE TIMELINE SHEET ──────────────────────────────────────────────────
+
+usage_timeline <- ssri_long %>%
+  select(redcap_id, drug = drug_lower, slot,
+         start_week = start_num, stop_week = stop_num,
+         dose_daily_mg, cit_equiv_dose) %>%
+  mutate(duration_weeks = stop_week - start_week) %>%
+  arrange(redcap_id, drug, start_week)
+
+# ── 11. DOSE FLAGS ────────────────────────────────────────────────────────────
+
+dose_flags <- ssri_long %>%
+  filter(dose_flag) %>%
+  select(redcap_id, slot, drug, dose)
+
+# ── 12. ASSEMBLE MASTER SCORES SHEET ─────────────────────────────────────────
+
+all_ids <- Medication_Data %>% select(redcap_id) %>% distinct()
+
+sheet_scores <- all_ids %>%
+  left_join(scores_cit,     by = "redcap_id") %>%
+  left_join(scores_raw_wide, by = "redcap_id")
+
+# ── 13. WRITE EXCEL ───────────────────────────────────────────────────────────
+
+out_path <- "C:/Users/jowjo/OneDrive/Desktop/ALL NYSPI/Data for Nicolo/Med Exposures Github Coded/new comprehensive file 04292026/SSRI_Exposure_Scores.xlsx"
+
+wb <- createWorkbook()
+
+header_style <- createStyle(
+  fontName = "Arial", fontSize = 10, fontColour = "white",
+  fgFill = "#2F4F8F", halign = "center", textDecoration = "bold",
+  border = "Bottom", borderColour = "#FFFFFF"
+)
+
+body_style <- createStyle(
+  fontName = "Arial", fontSize = 10,
+  numFmt = "0.00"
+)
+
+id_style <- createStyle(
+  fontName = "Arial", fontSize = 10
+)
+
+add_sheet <- function(wb, sheet_name, df) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, df, headerStyle = header_style)
+  addStyle(wb, sheet_name, body_style,
+           rows = 2:(nrow(df) + 1), cols = 2:ncol(df),
+           gridExpand = TRUE)
+  addStyle(wb, sheet_name, id_style,
+           rows = 2:(nrow(df) + 1), cols = 1,
+           gridExpand = TRUE)
+  setColWidths(wb, sheet_name, cols = 1:ncol(df), widths = "auto")
+  freezePane(wb, sheet_name, firstRow = TRUE)
+}
+
+add_sheet(wb, "Scores",         sheet_scores)
+add_sheet(wb, "Usage_Timeline", usage_timeline)
+
+if (nrow(dose_flags) > 0) {
+  add_sheet(wb, "Dose_Flags", dose_flags)
+}
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("Written to:", out_path, "\n")
+cat("Scores rows:", nrow(sheet_scores), "\n")
+cat("Timeline rows:", nrow(usage_timeline), "\n")
+if (nrow(dose_flags) > 0) cat("Dose flag rows:", nrow(dose_flags), "\n")
