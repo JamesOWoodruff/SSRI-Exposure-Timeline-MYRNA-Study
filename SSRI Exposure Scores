@@ -1,28 +1,34 @@
 library(tidyverse)
+library(readxl)
 
-END_OF_PREGNANCY <- 40
-
-ssri_equiv <- c(
-  "citalopram"    = 20,
-  "escitalopram"  = 10,
-  "fluoxetine"    = 20,
-  "paroxetine"    = 20,
-  "sertraline"    = 50
+# ── 0. Load ───────────────────────────────────────────────────────────────────
+Medication_Data <- read_excel(
+  "C:/Users/jowjo/OneDrive/Desktop/ALL NYSPI/Data for Nicolo/Med Exposures Github Coded/Medication Data.xlsx"
 )
 
-# ── 1. PIVOT WIDE → LONG ──────────────────────────────────────────────────────
+results_dir <- "C:/Users/jowjo/OneDrive/Desktop/ALL NYSPI/Work for Adi/Bayley Bitsea Plots 052726/Predicting BITSEABAYLEY by phq and ssri"
 
+END_OF_PREGNANCY <- 40
+W_T1T2_START <-  0; W_T1T2_END <- 26
+W_T3_START   <- 27; W_T3_END   <- 40
+
+ssri_equiv <- c(
+  "citalopram"   = 20,
+  "escitalopram" = 10,
+  "fluoxetine"   = 20,
+  "paroxetine"   = 20,
+  "sertraline"   = 50
+)
+
+# ── 1. Pivot wide → long ──────────────────────────────────────────────────────
 rx_slots <- 1:7
 
 long <- map_dfr(rx_slots, function(i) {
-  name_col  <- if (i <= 6) paste0("name_rx",  i) else "name_rx7"
-  class_col <- if (i <= 6) paste0("class_rx", i) else "class_rx7"
-  start_col <- if (i <= 6) paste0("pma_start_rx", i) else "pma_start_rx7"
-  stop_col  <- if (i <= 6) paste0("pma_stop_rx",  i) else "pma_stop_rx7"
-  dose_col  <- if (i <= 6) paste0("dose_rx",  i) else "dose_rx7"
-
-  # RX7 has non-standard column order in source: name_rx7, dose_rx7, class_rx7
-  # so class_rx7 exists as "class_rx7" — handled identically here
+  name_col  <- paste0("name_rx",      i)
+  class_col <- paste0("class_rx",     i)
+  start_col <- paste0("pma_start_rx", i)
+  stop_col  <- paste0("pma_stop_rx",  i)
+  dose_col  <- paste0("dose_rx",      i)
 
   Medication_Data %>%
     select(
@@ -37,9 +43,7 @@ long <- map_dfr(rx_slots, function(i) {
 }) %>%
   filter(!is.na(drug), drug != "")
 
-# ── 2. FILTER TO SSRI ONLY ────────────────────────────────────────────────────
-# Use class where available; fall back to drug name match for RX7 shifted rows
-
+# ── 2. Filter to SSRI only ────────────────────────────────────────────────────
 ssri_names <- names(ssri_equiv)
 
 ssri_long <- long %>%
@@ -51,11 +55,9 @@ ssri_long <- long %>%
   filter(is_ssri) %>%
   select(redcap_id, slot, drug, start, stop, dose)
 
-# ── 3. PARSE START / STOP TIMES ───────────────────────────────────────────────
-
+# ── 3. Parse start / stop ─────────────────────────────────────────────────────
 parse_time <- function(x) {
   x <- str_trim(as.character(x))
-  # known non-numeric sentinels → NA (will be handled by context rules)
   if (x %in% c("", "NA", "?", "UNK", "UNK-during pregnancy",
                 "UNK- beginning of pregnancy", "UNK-Unsure if taken")) return(NA_real_)
   suppressWarnings(as.numeric(x))
@@ -65,33 +67,20 @@ ssri_long <- ssri_long %>%
   mutate(
     start_num = map_dbl(start, parse_time),
     stop_num  = map_dbl(stop,  parse_time),
-    # missing start → started before pregnancy → 0
-    start_num = if_else(is.na(start_num), 0, start_num),
-    # missing stop → used through end of pregnancy → 40
-    stop_num  = if_else(is.na(stop_num),  END_OF_PREGNANCY, stop_num),
-    # clip negative starts to 0
-    start_num = if_else(start_num < 0, 0, start_num)
+    start_num = if_else(is.na(start_num), 0,                  start_num),
+    stop_num  = if_else(is.na(stop_num),  END_OF_PREGNANCY,   stop_num),
+    start_num = if_else(start_num < 0,    0,                  start_num)
   )
 
-# ── 4. PARSE DOSES ────────────────────────────────────────────────────────────
-
+# ── 4. Parse doses ────────────────────────────────────────────────────────────
 parse_dose <- function(x) {
   x <- str_trim(tolower(as.character(x)))
-
   if (x %in% c("", "na", "unk")) return(NA_real_)
-
-  # extract all numbers
   nums <- as.numeric(unlist(str_extract_all(x, "[0-9]+\\.?[0-9]*")))
   if (length(nums) == 0) return(NA_real_)
-
-  # base dose: average if range (e.g. "10-20"), else single value
   base <- if (length(nums) >= 2 && str_detect(x, "[0-9]\\s*-\\s*[0-9]")) {
     mean(nums[1:2])
-  } else {
-    nums[1]
-  }
-
-  # frequency multipliers
+  } else { nums[1] }
   mult <- case_when(
     str_detect(x, "bid|2\\s*x|x\\s*2|twice")          ~ 2,
     str_detect(x, "tid|3\\s*x|x\\s*3|three times")    ~ 3,
@@ -99,7 +88,6 @@ parse_dose <- function(x) {
     str_detect(x, "1 jour sur 2|every other day|q2d") ~ 0.5,
     TRUE                                               ~ 1
   )
-
   base * mult
 }
 
@@ -109,23 +97,10 @@ ssri_long <- ssri_long %>%
     dose_flag     = is.na(dose_daily_mg)
   )
 
-# ── 5. CITALOPRAM EQUIVALENTS ─────────────────────────────────────────────────
-
+# ── 5. Citalopram equivalents ─────────────────────────────────────────────────
 ssri_long <- ssri_long %>%
   mutate(
     drug_lower = tolower(str_trim(drug)),
-    equiv_dose = drug_lower %>% map_dbl(function(d) {
-      # match on partial name in case of trailing spaces or brand variations
-      key <- names(ssri_equiv)[str_detect(d, names(ssri_equiv))]
-      if (length(key) == 0) return(NA_real_)
-      equiv_dose_mg <- ssri_equiv[key[1]]
-      NA_real_  # placeholder — computed below after joining
-    })
-  )
-
-# cleaner approach: direct lookup then compute ratio
-ssri_long <- ssri_long %>%
-  mutate(
     ref_dose = case_when(
       str_detect(drug_lower, "citalopram")   ~ ssri_equiv["citalopram"],
       str_detect(drug_lower, "escitalopram") ~ ssri_equiv["escitalopram"],
@@ -134,32 +109,24 @@ ssri_long <- ssri_long %>%
       str_detect(drug_lower, "sertraline")   ~ ssri_equiv["sertraline"],
       TRUE                                   ~ NA_real_
     ),
-    # citalopram-equivalent = (actual dose / drug ref dose) * citalopram ref dose
     cit_equiv_dose = (dose_daily_mg / ref_dose) * ssri_equiv["citalopram"]
   )
 
-# ── 6. DEDUPLICATE EXACT DUPLICATE SEGMENTS ───────────────────────────────────
-
+# ── 6. Deduplicate ────────────────────────────────────────────────────────────
 ssri_long <- ssri_long %>%
   distinct(redcap_id, drug_lower, start_num, stop_num, dose_daily_mg, .keep_all = TRUE)
 
-# ── 7. HANDLE OVERLAPPING INTERVALS ───────────────────────────────────────────
-# For each participant, build a timeline by splitting at all breakpoints,
-# then in each sub-interval take the MAX citalopram-equivalent dose active.
-
+# ── 7. Resolve overlapping intervals ─────────────────────────────────────────
 resolve_overlaps <- function(df) {
-  # collect all breakpoints
   breaks <- sort(unique(c(df$start_num, df$stop_num)))
   if (length(breaks) < 2) return(
     tibble(start_num = df$start_num[1], stop_num = df$stop_num[1],
            cit_equiv_dose = df$cit_equiv_dose[1])
   )
-
   intervals <- tibble(
     start_num = breaks[-length(breaks)],
     stop_num  = breaks[-1]
   )
-
   intervals %>%
     mutate(
       cit_equiv_dose = map2_dbl(start_num, stop_num, function(s, e) {
@@ -178,38 +145,120 @@ timeline <- ssri_long %>%
   group_modify(~ resolve_overlaps(.x)) %>%
   ungroup()
 
-# ── 8. COMPUTE EXPOSURE SCORES ────────────────────────────────────────────────
-
-scores <- timeline %>%
-  mutate(duration = stop_num - start_num) %>%
-  group_by(redcap_id) %>%
-  summarise(
-    ssri_dose_weeks  = sum(cit_equiv_dose * duration, na.rm = TRUE),
-    ssri_mean_dose   = ssri_dose_weeks / END_OF_PREGNANCY,
-    .groups = "drop"
-  )
-
-# ── 9. FLAG RECORDS WITH UNPARSEABLE DOSES ────────────────────────────────────
-
-dose_flags <- ssri_long %>%
-  filter(dose_flag) %>%
-  select(redcap_id, slot, drug, dose)
-
-# ── 10. OUTPUT ────────────────────────────────────────────────────────────────
-
-cat("=== SSRI Exposure Scores ===\n")
-print(scores)
-
-if (nrow(dose_flags) > 0) {
-  cat("\n=== Records with unparseable doses (excluded from score) ===\n")
-  print(dose_flags)
+# ── 8. Compute window-specific exposure scores ────────────────────────────────
+# For each window, clip interval to window boundaries before summing
+clip_and_sum <- function(tl, win_start, win_end) {
+  tl %>%
+    mutate(
+      # clip interval to window
+      seg_start = pmax(start_num, win_start),
+      seg_end   = pmin(stop_num,  win_end),
+      duration  = pmax(seg_end - seg_start, 0)
+    ) %>%
+    filter(duration > 0) %>%
+    group_by(redcap_id) %>%
+    summarise(exposure = sum(cit_equiv_dose * duration, na.rm = TRUE),
+              .groups = "drop")
 }
 
-scores_export <- Medication_Data %>%
+scores_total <- timeline %>%
+  mutate(duration = stop_num - start_num) %>%
+  group_by(redcap_id) %>%
+  summarise(ssri_dose_total = sum(cit_equiv_dose * duration, na.rm = TRUE),
+            .groups = "drop")
+
+scores_t1t2 <- clip_and_sum(timeline, W_T1T2_START, W_T1T2_END) %>%
+  rename(ssri_dose_t1t2 = exposure)
+
+scores_t3 <- clip_and_sum(timeline, W_T3_START, W_T3_END) %>%
+  rename(ssri_dose_t3 = exposure)
+
+# ── 9. Combine ────────────────────────────────────────────────────────────────
+scores_combined <- Medication_Data %>%
   select(redcap_id) %>%
   distinct() %>%
-  left_join(scores, by = "redcap_id")
+  mutate(redcap_id = as.character(redcap_id)) %>%
+  left_join(scores_total, by = "redcap_id") %>%
+  left_join(scores_t1t2,  by = "redcap_id") %>%
+  left_join(scores_t3,    by = "redcap_id") %>%
+  # zero-fill: participants in file but no SSRI exposure scored = 0
+  mutate(across(starts_with("ssri_dose"), ~ replace_na(., 0)))
 
-write.csv(scores_export, 
-          file = "C:/Users/jowjo/OneDrive/Desktop/ALL NYSPI/Work for Milenna/03152026 Repository/Results/SSRI_Exposure_Scores.csv",
-          row.names = FALSE)
+# ── 10. Descriptives ──────────────────────────────────────────────────────────
+cat("=== Window-Specific SSRI Exposure Scores (non-zero only) ===\n\n")
+
+for (col in c("ssri_dose_total", "ssri_dose_t1t2", "ssri_dose_t3")) {
+  vals <- scores_combined %>%
+    filter(.data[[col]] > 0) %>%
+    pull(.data[[col]])
+  cat(col, "| N non-zero:", length(vals), "\n")
+  cat("  Mean:", round(mean(vals), 1),
+      "| SD:", round(sd(vals), 1),
+      "| Median:", round(median(vals), 1),
+      "| IQR:", round(quantile(vals, 0.25), 1),
+      "-", round(quantile(vals, 0.75), 1),
+      "| Min:", round(min(vals), 1),
+      "| Max:", round(max(vals), 1), "\n\n")
+}
+
+# ── 11. Correlation between window scores ─────────────────────────────────────
+cat("=== Correlations among dose scores (non-zero participants) ===\n")
+cor_dat <- scores_combined %>%
+  filter(ssri_dose_total > 0) %>%
+  select(ssri_dose_total, ssri_dose_t1t2, ssri_dose_t3)
+print(round(cor(cor_dat, use = "complete.obs"), 3))
+
+# ── 12. Distribution plots ────────────────────────────────────────────────────
+plot_dat <- scores_combined %>%
+  filter(ssri_dose_total > 0) %>%
+  pivot_longer(cols = starts_with("ssri_dose"),
+               names_to = "window", values_to = "exposure") %>%
+  filter(exposure > 0) %>%
+  mutate(window = case_when(
+    window == "ssri_dose_total" ~ "Total (0\u201340 wk)",
+    window == "ssri_dose_t1t2"  ~ "T1\u2013T2 (0\u201326 wk)",
+    window == "ssri_dose_t3"    ~ "T3 (27\u201340 wk)"
+  ),
+  window = factor(window, levels = c(
+    "Total (0\u201340 wk)", "T1\u2013T2 (0\u201326 wk)", "T3 (27\u201340 wk)"
+  )))
+
+p_dist <- ggplot(plot_dat, aes(x = exposure, fill = window)) +
+  geom_histogram(bins = 20, color = "white", alpha = 0.85) +
+  geom_vline(data = plot_dat %>%
+               group_by(window) %>%
+               summarise(med = median(exposure), .groups = "drop"),
+             aes(xintercept = med),
+             linetype = "dashed", color = "black", linewidth = 0.7) +
+  facet_wrap(~ window, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = c(
+    "Total (0\u201340 wk)"    = "#9B7DB5",
+    "T1\u2013T2 (0\u201326 wk)" = "#7B9EC9",
+    "T3 (27\u201340 wk)"     = "#4CAF8E"
+  ), guide = "none") +
+  labs(
+    title    = "Distribution of Window-Specific SSRI Cumulative Exposure",
+    subtitle = "Citalopram-normalized dose \u00d7 weeks | SSRI participants only | dashed line = median",
+    x = "Cumulative Exposure (citalopram-equivalent dose-weeks)",
+    y = "Count"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "white", color = NA),
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold", color = "#2A9D8F", size = 14),
+    plot.subtitle    = element_text(color = "gray40", size = 11)
+  )
+
+ggsave(file.path(results_dir, "plot_ssri_dose_distributions.png"),
+       p_dist, width = 13, height = 5, dpi = 300, bg = "white")
+
+# ── 13. Export ────────────────────────────────────────────────────────────────
+writexl::write_xlsx(
+  scores_combined,
+  file.path(results_dir, "SSRI_Exposure_Scores_Windowed.xlsx")
+)
+
+message("Windowed exposure scores saved.")
